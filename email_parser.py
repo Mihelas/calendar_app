@@ -14,7 +14,7 @@ from typing import Optional
 import google.generativeai as genai
 
 
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 
 @dataclass
