@@ -64,14 +64,24 @@ def _fetch_email(credentials: Credentials) -> str:
     return info.get("email", "")
 
 
+_VERIFIER_KEY = "_oauth_code_verifier"
+_STATE_KEY = "_oauth_state"
+
+
 def get_login_url() -> str:
-    """Return the Google authorization URL the user should be redirected to."""
+    """Return the Google authorization URL the user should be redirected to.
+
+    Persists the PKCE code verifier in `st.session_state` so the matching
+    `handle_oauth_callback` call can complete the token exchange.
+    """
     flow = _build_flow()
-    auth_url, _ = flow.authorization_url(
+    auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
+    st.session_state[_VERIFIER_KEY] = flow.code_verifier
+    st.session_state[_STATE_KEY] = state
     return auth_url
 
 
@@ -82,7 +92,16 @@ def handle_oauth_callback(code: str) -> Optional[UserSession]:
     signed-in email is not in the allowlist.
     """
     flow = _build_flow()
-    flow.fetch_token(code=code)
+    verifier = st.session_state.get(_VERIFIER_KEY)
+    if verifier:
+        flow.code_verifier = verifier
+
+    try:
+        flow.fetch_token(code=code)
+    finally:
+        st.session_state.pop(_VERIFIER_KEY, None)
+        st.session_state.pop(_STATE_KEY, None)
+
     credentials = flow.credentials
 
     email = _fetch_email(credentials)
