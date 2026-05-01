@@ -113,6 +113,9 @@ def list_events(
     return events
 
 
+_MAX_DESCRIPTION_CHARS = 7000
+
+
 def create_event(
     credentials: Credentials,
     title: str,
@@ -128,10 +131,20 @@ def create_event(
     `start` and `end` are naive `datetime` objects in local (`timezone_name`)
     time. Google Calendar interprets them in the supplied IANA timezone.
 
+    `description` is truncated to ~7000 characters. Google Calendar accepts
+    longer values but very long descriptions can cause UI/sync issues and
+    aren't useful for our purpose (preserving the original email).
+
     Returns the full event resource dict from the API (includes `htmlLink`,
     `id`, etc.).
     """
     service = _build_service(credentials)
+
+    if description and len(description) > _MAX_DESCRIPTION_CHARS:
+        description = (
+            description[:_MAX_DESCRIPTION_CHARS].rstrip()
+            + "\n\n... (gekürzt)"
+        )
 
     body = {
         "summary": title,

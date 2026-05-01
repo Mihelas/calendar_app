@@ -115,6 +115,26 @@ the requested permissions, and start using either tab.
 LibreOffice is installed automatically on Streamlit Cloud because of the
 `packages.txt` file in this repo.
 
+## Things to tell your users
+
+A few one-time and recurring quirks worth mentioning so they don't think
+something is broken:
+
+- **First sign-in shows an "unverified app" warning.** Because the OAuth app
+  is in *Testing* status, Google shows a scary-looking screen the first time
+  a user signs in. They must click **Advanced -> Continue to ... (unsafe)**.
+  This is normal for an unverified internal app and the screen only appears
+  once per user.
+- **Users have to sign in roughly once a week.** While the OAuth app is in
+  Testing status, Google issues refresh tokens that expire after 7 days. The
+  app will quietly drop them at the sign-in screen when this happens; just
+  signing in again restores everything. To remove this limit you'd publish
+  the app for verification (free but adds setup steps and isn't worth it for
+  a 2-3 user audience).
+- **Always review parsed values.** Gemini is good at extracting fields from
+  emails, but it can occasionally guess. The app shows the parsed values in
+  an editable form before adding them to the calendar -- read them first.
+
 ## Upgrading from the read-only version (existing users must re-authorize)
 
 If you previously deployed this app with only `calendar.readonly` scope, the

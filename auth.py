@@ -7,10 +7,19 @@ code for credentials. Credentials live in `st.session_state` only.
 
 from __future__ import annotations
 
+# Allow Google's token response to include scopes we didn't ask for. Google
+# routinely adds e.g. `userinfo.profile` when `openid` is requested, and
+# without this env var oauthlib raises a hard error mid-sign-in. Set BEFORE
+# importing google_auth_oauthlib / oauthlib.
+import os
+
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 from dataclasses import dataclass
 from typing import Optional
 
 import streamlit as st
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -111,7 +120,10 @@ def handle_oauth_callback(code: str) -> Optional[UserSession]:
 def get_current_session() -> Optional[UserSession]:
     """Return the active `UserSession` if logged in, else `None`.
 
-    Refreshes the access token transparently if it expired.
+    Refreshes the access token transparently if it expired. If the refresh
+    fails (token revoked, expired refresh token in Testing mode, network
+    error), the user is silently logged out and `None` is returned so the
+    caller renders the sign-in screen.
     """
     session: Optional[UserSession] = st.session_state.get("user_session")
     if session is None:
@@ -119,7 +131,14 @@ def get_current_session() -> Optional[UserSession]:
 
     creds = session.credentials
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except (RefreshError, Exception):
+            # Refresh tokens issued while the OAuth app is in Testing mode
+            # expire after 7 days. They're also revoked when the user removes
+            # the app from their Google account. Force a fresh sign-in.
+            logout()
+            return None
         st.session_state["user_session"] = UserSession(
             email=session.email, credentials=creds
         )

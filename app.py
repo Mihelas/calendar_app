@@ -109,6 +109,14 @@ def _login_screen() -> None:
 
     st.link_button("Sign in with Google", login_url, type="primary")
 
+    st.caption(
+        "First time signing in? Google may show a warning that this app "
+        "isn't verified. Click **Advanced** -> **Continue to ... (unsafe)** "
+        "to proceed -- this is expected for a small private app and the "
+        "screen only appears for new users. You may also need to sign in "
+        "again about once a week."
+    )
+
 
 def _process_oauth_callback() -> None:
     """If `?code=...` is present in the URL, finish the OAuth flow."""
@@ -140,19 +148,33 @@ def _process_oauth_callback() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _clear_user_state() -> None:
+    """Remove all per-user state from `st.session_state`.
+
+    Used on sign-out so a different user signing into the same browser
+    doesn't see leftover form data (calendar selections, parsed emails,
+    edited fields, etc.).
+    """
+    explicit_keys = {
+        "events_cache",
+        "generated_output",
+        "email_created_event",
+        "email_parsed",
+        "email_body",
+    }
+    prefix_keys = {"ef_", "field_", "sel_"}
+
+    for key in list(st.session_state.keys()):
+        if key in explicit_keys or any(key.startswith(p) for p in prefix_keys):
+            st.session_state.pop(key, None)
+
+
 def _sidebar(session: auth.UserSession) -> None:
     with st.sidebar:
         st.markdown(f"**Signed in as**\n\n{session.email}")
         if st.button("Sign out", use_container_width=True):
             auth.logout()
-            for key in (
-                "events_cache",
-                "generated_output",
-                "email_created_event",
-                "email_parsed",
-                "email_body",
-            ):
-                st.session_state.pop(key, None)
+            _clear_user_state()
             st.rerun()
 
 
@@ -407,10 +429,29 @@ def _reset_email_form() -> None:
 
 
 def _email_tab(session: auth.UserSession) -> None:
+    # If an event was just created, show only the success state. The form
+    # disappears so the user can't accidentally create a duplicate by
+    # double-clicking.
+    if event := st.session_state.get("email_created_event"):
+        st.success("Event added to your Google Calendar.")
+        if html_link := event.get("htmlLink"):
+            st.markdown(f"[Open it in Google Calendar]({html_link})")
+        st.caption(
+            "Tip: it now also shows up in the **Generate confirmations** tab."
+        )
+        if st.button(
+            "Create another from email",
+            type="primary",
+            use_container_width=True,
+        ):
+            _reset_email_form()
+            st.rerun()
+        return
+
     st.caption(
         "Paste a request email below. The app will use Gemini to extract the "
         "appointment details, then you review/edit and add it to your Google "
-        "Calendar."
+        "Calendar. Always double-check the parsed values before saving."
     )
     st.warning(
         "Privacy: the pasted email is sent to Google's Gemini API for parsing. "
@@ -429,11 +470,12 @@ def _email_tab(session: auth.UserSession) -> None:
 
     parse_col, reset_col = st.columns([1, 1])
     with parse_col:
-        parse_clicked = st.button(
-            "Parse email",
-            use_container_width=True,
-            disabled=not st.session_state.get("email_body", "").strip(),
-        )
+        # Buttons stay enabled regardless of widget state. Streamlit only
+        # commits text-area edits to session_state on commit (Ctrl+Enter or
+        # focus loss), so a `disabled=` based on the textarea value would
+        # leave the button greyed out the moment the user typed. We validate
+        # at click time instead.
+        parse_clicked = st.button("Parse email", use_container_width=True)
     with reset_col:
         if st.button("Reset form", use_container_width=True):
             _reset_email_form()
@@ -441,24 +483,27 @@ def _email_tab(session: auth.UserSession) -> None:
 
     if parse_clicked:
         body = st.session_state.get("email_body", "").strip()
-        try:
-            api_key = st.secrets["gemini_api_key"]
-        except KeyError:
-            st.error(
-                "Missing `gemini_api_key` in Streamlit secrets. "
-                "See README.md for setup."
-            )
-            return
-        try:
-            with st.spinner("Asking Gemini to extract the appointment..."):
-                parsed = parse_email(body, api_key=api_key)
-        except EmailParseError as exc:
-            st.error(f"Parsing failed: {exc}")
-            return
+        if not body:
+            st.warning("Paste an email first.")
+        else:
+            try:
+                api_key = st.secrets["gemini_api_key"]
+            except KeyError:
+                st.error(
+                    "Missing `gemini_api_key` in Streamlit secrets. "
+                    "See README.md for setup."
+                )
+                return
+            try:
+                with st.spinner("Asking Gemini to extract the appointment..."):
+                    parsed = parse_email(body, api_key=api_key)
+            except EmailParseError as exc:
+                st.error(f"Parsing failed: {exc}")
+                return
 
-        st.session_state["email_parsed"] = parsed
-        _apply_parsed_to_form(parsed, body)
-        st.rerun()
+            st.session_state["email_parsed"] = parsed
+            _apply_parsed_to_form(parsed, body)
+            st.rerun()
 
     if parsed := st.session_state.get("email_parsed"):
         if not parsed.customer_name and not parsed.date:
@@ -490,10 +535,14 @@ def _email_tab(session: auth.UserSession) -> None:
         "Add to my Google Calendar",
         type="primary",
         use_container_width=True,
-        disabled=not st.session_state["ef_title"].strip(),
     )
 
     if create_clicked:
+        title = st.session_state["ef_title"].strip()
+        if not title:
+            st.warning("Title is required.")
+            return
+
         event_date = st.session_state["ef_date"]
         start_t = st.session_state["ef_start"]
         end_t = st.session_state["ef_end"]
@@ -502,38 +551,32 @@ def _email_tab(session: auth.UserSession) -> None:
 
         if end_dt <= start_dt:
             st.error("End time must be after start time.")
-        else:
-            try:
-                with st.spinner("Creating the event..."):
-                    event = create_event(
-                        credentials=session.credentials,
-                        title=st.session_state["ef_title"].strip(),
-                        start=start_dt,
-                        end=end_dt,
-                        location=st.session_state["ef_location"].strip(),
-                        description=st.session_state["ef_description"],
-                    )
-            except HttpError as exc:
-                if exc.resp.status in (401, 403):
-                    st.error(
-                        "Permission denied. The app's calendar permissions "
-                        "have changed: please sign out and sign in again to "
-                        "grant access to add events, then try once more."
-                    )
-                else:
-                    st.error(f"Could not create the event: {exc}")
-            except Exception as exc:  # pragma: no cover - defensive
-                st.error(f"Could not create the event: {exc}")
-            else:
-                st.session_state["email_created_event"] = event
-                st.session_state.pop("events_cache", None)
+            return
 
-    if event := st.session_state.get("email_created_event"):
-        st.success("Event added to your Google Calendar.")
-        if html_link := event.get("htmlLink"):
-            st.markdown(f"[Open it in Google Calendar]({html_link})")
-        if st.button("Create another from email"):
-            _reset_email_form()
+        try:
+            with st.spinner("Creating the event..."):
+                event = create_event(
+                    credentials=session.credentials,
+                    title=title,
+                    start=start_dt,
+                    end=end_dt,
+                    location=st.session_state["ef_location"].strip(),
+                    description=st.session_state["ef_description"],
+                )
+        except HttpError as exc:
+            if exc.resp.status in (401, 403):
+                st.error(
+                    "Permission denied. The app's calendar permissions "
+                    "have changed: please sign out and sign in again to "
+                    "grant access to add events, then try once more."
+                )
+            else:
+                st.error(f"Could not create the event: {exc}")
+        except Exception as exc:  # pragma: no cover - defensive
+            st.error(f"Could not create the event: {exc}")
+        else:
+            st.session_state["email_created_event"] = event
+            st.session_state.pop("events_cache", None)
             st.rerun()
 
 
