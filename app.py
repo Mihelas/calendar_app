@@ -1,12 +1,12 @@
 """EINSATZBESTÄTIGUNG app - Streamlit UI.
 
-Flow:
-1. Sign in with Google (OAuth web flow, calendar.readonly scope).
-2. Pick a date range; the app lists upcoming Google Calendar events.
-3. Tick the events you want to confirm. For each selected event, an editable
-   form is shown with prefilled fields.
-4. Click "Generate PDF(s)" to render the EINSATZBESTÄTIGUNG template and
-   convert it to PDF. Download a single PDF or a ZIP of all generated PDFs.
+Two main features (in tabs):
+
+1. **Generate confirmations** - pick existing Google Calendar appointments,
+   edit a prefilled form, export PDFs of the EINSATZBESTÄTIGUNG template.
+2. **Create from email** - paste a request email, Gemini parses it into
+   structured fields, the user reviews/edits, and the app creates a new
+   Google Calendar event.
 """
 
 from __future__ import annotations
@@ -14,13 +14,25 @@ from __future__ import annotations
 import io
 import re
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import streamlit as st
+from googleapiclient.errors import HttpError
 
 import auth
-from calendar_client import CalendarEvent, event_to_fields, list_events
+from calendar_client import (
+    CalendarEvent,
+    create_event,
+    event_to_fields,
+    list_events,
+)
+from email_parser import (
+    EmailParseError,
+    ParsedAppointment,
+    default_event_title,
+    parse_email,
+)
 from pdf_converter import PdfConversionError, docx_to_pdf
 from template_renderer import REQUIRED_FIELDS, render_docx
 
@@ -33,7 +45,7 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 
@@ -50,11 +62,36 @@ def _pdf_filename(fields: dict[str, str]) -> str:
     return f"einsatzbestaetigung_{name}_{datum}.pdf"
 
 
+def _try_parse_iso_date(value: str) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _try_parse_hhmm(value: str) -> Optional[time]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%H:%M").time()
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Login flow
+# ---------------------------------------------------------------------------
+
+
 def _login_screen() -> None:
     st.title("EINSATZBESTÄTIGUNG")
     st.write(
         "Sign in with your Google account to access your calendar. "
-        "The app only requests **read-only** access to your calendar events."
+        "The app needs permission to **read your events** (to fill the "
+        "EINSATZBESTÄTIGUNG template) and to **add new events** (when you "
+        "create one from a pasted email)."
     )
 
     try:
@@ -63,7 +100,7 @@ def _login_screen() -> None:
         st.error(
             "Missing Streamlit secret: "
             f"`{exc.args[0]}`. Copy `.streamlit/secrets.toml.example` to "
-            "`.streamlit/secrets.toml` and fill in the OAuth client values."
+            "`.streamlit/secrets.toml` and fill in the required values."
         )
         return
     except Exception as exc:  # pragma: no cover - defensive
@@ -99,38 +136,51 @@ def _process_oauth_callback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main UI
+# Sidebar
 # ---------------------------------------------------------------------------
 
 
-def _sidebar(session: auth.UserSession) -> tuple[date, date]:
+def _sidebar(session: auth.UserSession) -> None:
     with st.sidebar:
         st.markdown(f"**Signed in as**\n\n{session.email}")
         if st.button("Sign out", use_container_width=True):
             auth.logout()
-            st.session_state.pop("events_cache", None)
-            st.session_state.pop("generated_output", None)
+            for key in (
+                "events_cache",
+                "generated_output",
+                "email_created_event",
+                "email_parsed",
+                "email_body",
+            ):
+                st.session_state.pop(key, None)
             st.rerun()
 
-        st.divider()
-        st.subheader("Date range")
-        today = date.today()
-        default_range = (today, today + timedelta(days=14))
-        picked = st.date_input(
-            "Show events between",
-            value=default_range,
-            format="DD.MM.YYYY",
-        )
-        if isinstance(picked, tuple) and len(picked) == 2:
-            start, end = picked
-        else:
-            start = end = picked  # single date selected
-        if start > end:
-            start, end = end, start
-        return start, end
+
+# ---------------------------------------------------------------------------
+# Tab 1: Generate confirmations (existing PDF flow)
+# ---------------------------------------------------------------------------
 
 
-def _fetch_events(session: auth.UserSession, start: date, end: date) -> list[CalendarEvent]:
+def _date_range_picker() -> tuple[date, date]:
+    today = date.today()
+    default_range = (today, today + timedelta(days=14))
+    picked = st.date_input(
+        "Show events between",
+        value=default_range,
+        format="DD.MM.YYYY",
+    )
+    if isinstance(picked, tuple) and len(picked) == 2:
+        start, end = picked
+    else:
+        start = end = picked  # single date selected
+    if start > end:
+        start, end = end, start
+    return start, end
+
+
+def _fetch_events(
+    session: auth.UserSession, start: date, end: date
+) -> list[CalendarEvent]:
     cache_key = ("events_cache", start.isoformat(), end.isoformat(), session.email)
     cached = st.session_state.get("events_cache")
     if cached and cached.get("key") == cache_key:
@@ -153,11 +203,11 @@ def _event_form(event: CalendarEvent) -> dict[str, str]:
         "occasion": "ANLASS",
     }
     values: dict[str, str] = {}
-    for field in REQUIRED_FIELDS:
-        key = f"field_{event.id}_{field}"
-        values[field] = st.text_input(
-            field_labels[field],
-            value=st.session_state.get(key, defaults.get(field, "")),
+    for field_name in REQUIRED_FIELDS:
+        key = f"field_{event.id}_{field_name}"
+        values[field_name] = st.text_input(
+            field_labels[field_name],
+            value=st.session_state.get(key, defaults.get(field_name, "")),
             key=key,
         )
     return values
@@ -201,30 +251,32 @@ def _generate_outputs(
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         used: dict[str, int] = {}
         for filename, data in pdfs:
-            # Avoid name collisions inside the ZIP.
             count = used.get(filename, 0)
             used[filename] = count + 1
-            unique = filename if count == 0 else filename.replace(".pdf", f"_{count + 1}.pdf")
+            unique = (
+                filename
+                if count == 0
+                else filename.replace(".pdf", f"_{count + 1}.pdf")
+            )
             zf.writestr(unique, data)
     return buf.getvalue(), "einsatzbestaetigungen.zip", "application/zip"
 
 
-def _main_screen(session: auth.UserSession) -> None:
-    start, end = _sidebar(session)
-
-    st.title("EINSATZBESTÄTIGUNG")
+def _pdf_tab(session: auth.UserSession) -> None:
     st.caption(
-        "Pick the appointments you want to confirm. Each selected appointment gets "
-        "an editable form below; PDFs are generated from your final values."
+        "Pick the appointments you want to confirm. Each selected appointment "
+        "gets an editable form below; PDFs are generated from your final values."
     )
+
+    start, end = _date_range_picker()
 
     try:
         events = _fetch_events(session, start, end)
+    except HttpError as exc:
+        st.error(f"Could not load calendar: {exc}")
+        return
     except Exception as exc:
         st.error(f"Could not load calendar: {exc}")
-        if st.button("Sign out and retry"):
-            auth.logout()
-            st.rerun()
         return
 
     if not events:
@@ -287,6 +339,218 @@ def _main_screen(session: auth.UserSession) -> None:
             type="primary",
             use_container_width=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tab 2: Create from email
+# ---------------------------------------------------------------------------
+
+
+_EMAIL_FORM_DEFAULTS = {
+    "ef_title": "",
+    "ef_date": None,        # set lazily to today + 1
+    "ef_start": time(9, 0),
+    "ef_end": time(10, 0),
+    "ef_location": "",
+    "ef_description": "",
+}
+
+
+def _ensure_email_form_defaults() -> None:
+    for key, default in _EMAIL_FORM_DEFAULTS.items():
+        if key not in st.session_state:
+            if key == "ef_date":
+                st.session_state[key] = date.today() + timedelta(days=1)
+            else:
+                st.session_state[key] = default
+
+
+def _apply_parsed_to_form(parsed: ParsedAppointment, raw_body: str) -> None:
+    """Update the form's session_state keys based on parsed Gemini output."""
+    st.session_state["ef_title"] = default_event_title(parsed)
+
+    parsed_date = _try_parse_iso_date(parsed.date)
+    if parsed_date is not None:
+        st.session_state["ef_date"] = parsed_date
+
+    parsed_start = _try_parse_hhmm(parsed.start_time)
+    if parsed_start is not None:
+        st.session_state["ef_start"] = parsed_start
+
+    parsed_end = _try_parse_hhmm(parsed.end_time)
+    if parsed_end is not None:
+        st.session_state["ef_end"] = parsed_end
+    elif parsed_start is not None:
+        st.session_state["ef_end"] = (
+            datetime.combine(date.today(), parsed_start) + timedelta(hours=1)
+        ).time()
+
+    if parsed.location:
+        st.session_state["ef_location"] = parsed.location
+
+    description_parts = []
+    if parsed.sender_note:
+        description_parts.append(parsed.sender_note)
+    if raw_body:
+        description_parts.append("--- Originale E-Mail ---")
+        description_parts.append(raw_body.strip())
+    st.session_state["ef_description"] = "\n\n".join(description_parts).strip()
+
+
+def _reset_email_form() -> None:
+    for key in list(_EMAIL_FORM_DEFAULTS.keys()) + [
+        "email_body",
+        "email_parsed",
+        "email_created_event",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _email_tab(session: auth.UserSession) -> None:
+    st.caption(
+        "Paste a request email below. The app will use Gemini to extract the "
+        "appointment details, then you review/edit and add it to your Google "
+        "Calendar."
+    )
+    st.warning(
+        "Privacy: the pasted email is sent to Google's Gemini API for parsing. "
+        "Don't paste anything you don't want shared with that service.",
+        icon=":material/lock:",
+    )
+
+    _ensure_email_form_defaults()
+
+    st.text_area(
+        "Email body",
+        key="email_body",
+        height=240,
+        placeholder="Hallo, du hast eine Nachricht...\n\nThema: ...\nDatum: ...",
+    )
+
+    parse_col, reset_col = st.columns([1, 1])
+    with parse_col:
+        parse_clicked = st.button(
+            "Parse email",
+            use_container_width=True,
+            disabled=not st.session_state.get("email_body", "").strip(),
+        )
+    with reset_col:
+        if st.button("Reset form", use_container_width=True):
+            _reset_email_form()
+            st.rerun()
+
+    if parse_clicked:
+        body = st.session_state.get("email_body", "").strip()
+        try:
+            api_key = st.secrets["gemini_api_key"]
+        except KeyError:
+            st.error(
+                "Missing `gemini_api_key` in Streamlit secrets. "
+                "See README.md for setup."
+            )
+            return
+        try:
+            with st.spinner("Asking Gemini to extract the appointment..."):
+                parsed = parse_email(body, api_key=api_key)
+        except EmailParseError as exc:
+            st.error(f"Parsing failed: {exc}")
+            return
+
+        st.session_state["email_parsed"] = parsed
+        _apply_parsed_to_form(parsed, body)
+        st.rerun()
+
+    if parsed := st.session_state.get("email_parsed"):
+        if not parsed.customer_name and not parsed.date:
+            st.warning(
+                "Gemini couldn't find appointment details in this email. "
+                "Fill the form manually or paste a different email."
+            )
+        else:
+            st.info("Parsed. Review and edit before adding to your calendar.")
+
+    st.divider()
+    st.subheader("Event details")
+
+    st.text_input(
+        "Title",
+        key="ef_title",
+        help="Will appear as the event summary in Google Calendar.",
+    )
+    st.date_input("Date", key="ef_date", format="DD.MM.YYYY")
+    time_cols = st.columns(2)
+    with time_cols[0]:
+        st.time_input("Start time", key="ef_start", step=300)
+    with time_cols[1]:
+        st.time_input("End time", key="ef_end", step=300)
+    st.text_area("Location", key="ef_location", height=100)
+    st.text_area("Description / notes", key="ef_description", height=200)
+
+    create_clicked = st.button(
+        "Add to my Google Calendar",
+        type="primary",
+        use_container_width=True,
+        disabled=not st.session_state["ef_title"].strip(),
+    )
+
+    if create_clicked:
+        event_date = st.session_state["ef_date"]
+        start_t = st.session_state["ef_start"]
+        end_t = st.session_state["ef_end"]
+        start_dt = datetime.combine(event_date, start_t)
+        end_dt = datetime.combine(event_date, end_t)
+
+        if end_dt <= start_dt:
+            st.error("End time must be after start time.")
+        else:
+            try:
+                with st.spinner("Creating the event..."):
+                    event = create_event(
+                        credentials=session.credentials,
+                        title=st.session_state["ef_title"].strip(),
+                        start=start_dt,
+                        end=end_dt,
+                        location=st.session_state["ef_location"].strip(),
+                        description=st.session_state["ef_description"],
+                    )
+            except HttpError as exc:
+                if exc.resp.status in (401, 403):
+                    st.error(
+                        "Permission denied. The app's calendar permissions "
+                        "have changed: please sign out and sign in again to "
+                        "grant access to add events, then try once more."
+                    )
+                else:
+                    st.error(f"Could not create the event: {exc}")
+            except Exception as exc:  # pragma: no cover - defensive
+                st.error(f"Could not create the event: {exc}")
+            else:
+                st.session_state["email_created_event"] = event
+                st.session_state.pop("events_cache", None)
+
+    if event := st.session_state.get("email_created_event"):
+        st.success("Event added to your Google Calendar.")
+        if html_link := event.get("htmlLink"):
+            st.markdown(f"[Open it in Google Calendar]({html_link})")
+        if st.button("Create another from email"):
+            _reset_email_form()
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Top-level layout
+# ---------------------------------------------------------------------------
+
+
+def _main_screen(session: auth.UserSession) -> None:
+    _sidebar(session)
+    st.title("EINSATZBESTÄTIGUNG")
+
+    pdf_tab, email_tab = st.tabs(["Generate confirmations", "Create from email"])
+    with pdf_tab:
+        _pdf_tab(session)
+    with email_tab:
+        _email_tab(session)
 
 
 # ---------------------------------------------------------------------------

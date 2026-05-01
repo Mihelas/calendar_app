@@ -113,6 +113,43 @@ def list_events(
     return events
 
 
+def create_event(
+    credentials: Credentials,
+    title: str,
+    start: datetime,
+    end: datetime,
+    location: str = "",
+    description: str = "",
+    timezone_name: str = "Europe/Berlin",
+    calendar_id: str = "primary",
+) -> dict:
+    """Insert a new event into the user's calendar and return the API response.
+
+    `start` and `end` are naive `datetime` objects in local (`timezone_name`)
+    time. Google Calendar interprets them in the supplied IANA timezone.
+
+    Returns the full event resource dict from the API (includes `htmlLink`,
+    `id`, etc.).
+    """
+    service = _build_service(credentials)
+
+    body = {
+        "summary": title,
+        "location": location,
+        "description": description,
+        "start": {
+            "dateTime": start.replace(tzinfo=None).isoformat(timespec="seconds"),
+            "timeZone": timezone_name,
+        },
+        "end": {
+            "dateTime": end.replace(tzinfo=None).isoformat(timespec="seconds"),
+            "timeZone": timezone_name,
+        },
+    }
+
+    return service.events().insert(calendarId=calendar_id, body=body).execute()
+
+
 def event_to_fields(event: CalendarEvent) -> dict[str, str]:
     """Best-guess mapping from a calendar event to template fields.
 
