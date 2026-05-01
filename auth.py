@@ -77,7 +77,10 @@ def get_login_url() -> str:
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
+        # `select_account` forces Google's account picker every login so users
+        # with multiple Google accounts in their browser don't silently end up
+        # signed in with the wrong one (would trip our `allowed_emails` gate).
+        prompt="select_account consent",
     )
     return auth_url
 
