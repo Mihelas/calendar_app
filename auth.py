@@ -47,6 +47,13 @@ def _client_config() -> dict:
 def _build_flow() -> Flow:
     flow = Flow.from_client_config(_client_config(), scopes=SCOPES)
     flow.redirect_uri = st.secrets["redirect_uri"]
+    # Disable PKCE. We use a confidential Web client (client_secret kept on the
+    # server) so PKCE is optional. Streamlit's session state is not reliably
+    # preserved across the OAuth redirect, which would otherwise lose the
+    # generated `code_verifier` between steps and cause `invalid_grant: Missing
+    # code verifier` at token exchange time.
+    flow.autogenerate_code_verifier = False
+    flow.code_verifier = None
     return flow
 
 
@@ -64,24 +71,14 @@ def _fetch_email(credentials: Credentials) -> str:
     return info.get("email", "")
 
 
-_VERIFIER_KEY = "_oauth_code_verifier"
-_STATE_KEY = "_oauth_state"
-
-
 def get_login_url() -> str:
-    """Return the Google authorization URL the user should be redirected to.
-
-    Persists the PKCE code verifier in `st.session_state` so the matching
-    `handle_oauth_callback` call can complete the token exchange.
-    """
+    """Return the Google authorization URL the user should be redirected to."""
     flow = _build_flow()
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
-    st.session_state[_VERIFIER_KEY] = flow.code_verifier
-    st.session_state[_STATE_KEY] = state
     return auth_url
 
 
@@ -92,16 +89,7 @@ def handle_oauth_callback(code: str) -> Optional[UserSession]:
     signed-in email is not in the allowlist.
     """
     flow = _build_flow()
-    verifier = st.session_state.get(_VERIFIER_KEY)
-    if verifier:
-        flow.code_verifier = verifier
-
-    try:
-        flow.fetch_token(code=code)
-    finally:
-        st.session_state.pop(_VERIFIER_KEY, None)
-        st.session_state.pop(_STATE_KEY, None)
-
+    flow.fetch_token(code=code)
     credentials = flow.credentials
 
     email = _fetch_email(credentials)
