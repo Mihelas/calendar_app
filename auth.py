@@ -90,7 +90,13 @@ def get_login_url() -> str:
         # `select_account` forces Google's account picker every login so users
         # with multiple Google accounts in their browser don't silently end up
         # signed in with the wrong one (would trip our `allowed_emails` gate).
-        prompt="select_account consent",
+        # We deliberately do NOT pass "consent" here: that would force Google
+        # to re-show the permissions screen on every single sign-in. By
+        # omitting it, returning users only see the consent screen the first
+        # time they grant access; future logins go straight from account
+        # picker to the app. (We only re-prompt for consent automatically if
+        # the requested scopes change.)
+        prompt="select_account",
     )
     return auth_url
 
