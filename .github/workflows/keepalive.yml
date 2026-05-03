@@ -25,11 +25,19 @@ jobs:
       - name: Ping app health endpoint
         run: |
           set -euo pipefail
-          STATUS=$(curl --silent --show-error --location --max-time 60 \
+          # Do NOT follow redirects: when the app is asleep, Streamlit
+          # serves a redirect to its "wake this app" page that loops on
+          # itself, exhausting curl's redirect limit. We don't need to
+          # reach a final 200 -- we just need our HTTP request to land on
+          # Streamlit's servers, which is enough to keep the app warm
+          # (and to wake it on the next user visit).
+          STATUS=$(curl --silent --show-error --max-time 60 \
             --output /dev/null --write-out '%{http_code}' \
             "${APP_URL}/_stcore/health")
           echo "HTTP ${STATUS} from ${APP_URL}/_stcore/health"
-          if [ "${STATUS}" != "200" ]; then
-            echo "Unexpected status code"
-            exit 1
-          fi
+          # Treat any 2xx (app awake) or 3xx (app asleep, redirected to
+          # wake page) as a successful ping. Anything else is unexpected.
+          case "${STATUS}" in
+            2??|3??) echo "OK"; exit 0 ;;
+            *) echo "Unexpected status code"; exit 1 ;;
+          esac
